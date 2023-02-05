@@ -1,0 +1,188 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  AWS CloudFormation Sample Template to create lab resources. Creates a DynamoDB
+  table, SNS Topic, SNS Topic Policy, IAM role, and CloudWatch LogGroups.
+
+  **WARNING** You will be billed for the AWS resources created if you create a
+  stack from this template.
+
+  Copyright 2021 Amazon.com, Inc. or its affiliates. All Rights Reserved.
+
+  Licensed under the Apache License, Version 2.0 (the "License"). You may not
+  use this file except in compliance with the License. A copy of the License is
+  located at
+
+      https://www.apache.org/licenses/LICENSE-2.0
+
+  or in the "license" file accompanying this file. This file is distributed  on
+  an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express
+  or implied. See the License for the specific language governing permissions
+  and limitations under the License.
+
+Transform: 'AWS::Serverless-2016-10-31'
+  
+Resources:
+  RiskTrackingLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/wa-risk-tracking
+  
+  UpdateWorkloadLambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/lambda/wa-update-workload
+  
+  LambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: wa-risk-tracking-lambda-role
+      ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: wa-risk-tracking-lambda-policy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Sid: VisualEditor0
+                Effect: Allow
+                Action:
+                  - 'dynamodb:PutItem'
+                  - 'dynamodb:DeleteItem'
+                  - 'dynamodb:GetItem'
+                Resource: !GetAtt
+                  - DynamoDBTable
+                  - Arn
+              - Sid: VisualEditor1
+                Effect: Allow
+                Action:
+                  - 'wellarchitected:ListWorkloads'
+                  - 'wellarchitected:GetAnswer'
+                  - 'wellarchitected:GetWorkload'
+                  - 'wellarchitected:ListLensReviewImprovements'
+                  - 'ssm:GetOpsItem'
+                  - 'wellarchitected:UpdateAnswer'
+                  - 'ssm:CreateOpsItem'
+                Resource: '*'
+  
+  DynamoDBTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: workload_id
+          AttributeType: S
+        - AttributeName: question_id
+          AttributeType: S
+      TableName: wa_workload_data
+      KeySchema:
+        - AttributeName: workload_id
+          KeyType: HASH
+        - AttributeName: question_id
+          KeyType: RANGE
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+  
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: wa-risk-tracking
+      Subscription:
+        - Protocol: lambda
+          Endpoint: !GetAtt UpdateWorkloadLambdaFunction.Arn
+  
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSTopic
+      PolicyDocument:
+        Version: 2012-10-17
+        Id: __default_policy_ID
+        Statement:
+          - Sid: Allow OpsCenter to publish to this topic
+            Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: 'SNS:Publish'
+            Resource: !Ref SNSTopic
+
+  UpdateWorkloadLambdaFunction:
+      Type: "AWS::Lambda::Function"
+      Properties:
+          Description: "Lambda to update the workload"
+          FunctionName: wa-update-workload
+          Handler: update_workload.lambda_handler
+          Architectures: 
+            - "x86_64"
+          Code: 
+              S3Bucket: wellarchitectedsam
+              S3Key: functions/update_workload.zip
+          MemorySize: 256
+          Role: !GetAtt LambdaRole.Arn
+          Runtime: "python3.8"
+          PackageType: "Zip"
+          Timeout: 303
+
+  TrackWorkloadLambdaFunction:
+      Type: "AWS::Lambda::Function"
+      Properties:
+          Description: "Lambda function to scan existing workloads and create Opsitems in OpsCenter for HRIs/MRIs"
+          Environment: 
+              Variables: 
+                  sns_topic_arn: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:wa-risk-tracking"
+          FunctionName: wa-risk-tracking
+          Handler: risk_tracking.lambda_handler
+          Architectures: 
+            - "x86_64"
+          Code: 
+              S3Bucket: wellarchitectedsam
+              S3Key: functions/risk_tracking.zip
+          MemorySize: 256
+          Role: !GetAtt LambdaRole.Arn
+          Runtime: "python3.8"
+          PackageType: "Zip"
+          Timeout: 303
+
+  SNSSubscriptionUpdateWorkloadLambdaFunction:
+      Type: AWS::SNS::Subscription
+      Properties:
+          Protocol: lambda
+          Endpoint: !GetAtt UpdateWorkloadLambdaFunction.Arn
+          TopicArn: !Ref SNSTopic
+
+  InvokeTrackWorkloadLambdaFunction:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+        Action: "lambda:InvokeFunction"
+        FunctionName: !GetAtt TrackWorkloadLambdaFunction.Arn
+        Principal: "events.amazonaws.com"
+        SourceArn: !GetAtt EventBridgeRule.Arn        
+
+  InvokeUpdateWorkloadLambdaFunction:
+      Type: "AWS::Lambda::Permission"
+      Properties:
+          Action: "lambda:InvokeFunction"
+          FunctionName: !GetAtt UpdateWorkloadLambdaFunction.Arn
+          Principal: "sns.amazonaws.com"
+          SourceArn: !Sub "arn:aws:sns:${AWS::Region}:${AWS::AccountId}:wa-risk-tracking"
+
+  EventBridgeRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: trackworkload-eventbus-bridge
+        Description: "Rule for triggering TrackWorkload Lambda Function"
+        ScheduleExpression: 'rate(12 hours)'
+        State: ENABLED
+        Targets:
+          - Id: trackworkload-lambda-function
+            Arn: !GetAtt TrackWorkloadLambdaFunction.Arn
